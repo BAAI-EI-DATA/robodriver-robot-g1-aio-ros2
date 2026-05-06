@@ -10,11 +10,32 @@ import rclpy
 
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
+from rosidl_runtime_py.utilities import get_message
 
 from std_msgs.msg import Header, Float32, Float32MultiArray
 from sensor_msgs.msg import Image, JointState, CompressedImage
 from geometry_msgs.msg import Pose
 from nav_msgs.msg import Odometry
+
+try:
+    from unitree_hg.msg import LowState as UnitreeHgLowState
+except ImportError:
+    UnitreeHgLowState = None
+
+try:
+    from unitree_hg.msg import HandState as UnitreeHgHandState
+except ImportError:
+    UnitreeHgHandState = None
+
+try:
+    from unitree_go.msg import LowState as UnitreeGoLowState
+except ImportError:
+    UnitreeGoLowState = None
+
+try:
+    from unitree_go.msg import HandState as UnitreeGoHandState
+except ImportError:
+    UnitreeGoHandState = None
 
 from rclpy.qos import (
     QoSProfile,
@@ -35,44 +56,92 @@ QOS_BEST_EFFORT = QoSProfile(
     durability=QoSDurabilityPolicy.VOLATILE,
 )
 
+MSG_CLASS_BY_NAME = {
+    "JointState": JointState,
+    "Pose": Pose,
+    "Odometry": Odometry,
+    "Float32MultiArray": Float32MultiArray,
+    "Float32": Float32,
+}
+
+MSG_ALIASES = {
+    "LowState": (
+        "unitree_hg/msg/LowState",
+        "unitree_go/msg/LowState",
+    ),
+    "Dex3State": (
+        "unitree_hg/msg/HandState",
+        "unitree_hg/msg/Dex3State",
+        "unitree_go/msg/HandState",
+        "unitree_go/msg/Dex3State",
+    ),
+    "HandState": (
+        "unitree_hg/msg/HandState",
+        "unitree_go/msg/HandState",
+    ),
+}
+
+
+def _get_msg_class(msg_name: str):
+    if msg_name in MSG_CLASS_BY_NAME:
+        return MSG_CLASS_BY_NAME[msg_name]
+
+    if msg_name == "LowState":
+        for msg_cls in (UnitreeHgLowState, UnitreeGoLowState):
+            if msg_cls is not None:
+                return msg_cls
+
+    if msg_name in ("HandState", "Dex3State"):
+        for msg_cls in (UnitreeHgHandState, UnitreeGoHandState):
+            if msg_cls is not None:
+                return msg_cls
+
+    candidates = MSG_ALIASES.get(msg_name, (msg_name,))
+    last_error = None
+    for candidate in candidates:
+        try:
+            return get_message(candidate)
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"Unsupported ROS msg type: {msg_name}") from last_error
+
+
 # 由生成脚本根据 JSON 自动生成
 NODE_CONFIG = {
     "leader_joint_topics": {
-        "leader_left_wrist": {
-            "topic": "/vr/left_wrist/xyz_rpy",
-            "msg": "Float32MultiArray",
-            "len": 6
-        },
-        "leader_right_wrist": {
-            "topic": "/vr/right_wrist/xyz_rpy",
-            "msg": "Float32MultiArray",
-            "len": 6
-        },
-        "leader_head": {
-            "topic": "/vr/head/xyz_rpy",
-            "msg": "Float32MultiArray",
-            "len": 6
+        "leader_joint_states": {
+            "topic": "/lowcmd",
+            "msg": "LowState",
+            "len": 29
         },
         "leader_left_hand": {
-            "topic": "/vr/left_hand",
-            "msg": "Float32MultiArray",
+            "topic": "/dex3/left/cmd",
+            "msg": "HandState",
             "len": 7
         },
         "leader_right_hand": {
-            "topic": "/vr/right_hand",
-            "msg": "Float32MultiArray",
+            "topic": "/dex3/right/cmd",
+            "msg": "HandState",
             "len": 7
         }
     },
 
     "follower_joint_topics": {
-        "follower_body_joint_states": {
-            "topic": "/joint_states",
-            "msg": "JointState"
+        "follower_joint_states": {
+            "topic": "/lowstate",
+            "msg": "LowState",
+            "len": 29
         },
-        "follower_hand_joint_states": {
-            "topic": "/joint_states",
-            "msg": "JointState"
+        "follower_left_hand": {
+            "topic": "/dex3/left/state",
+            "msg": "HandState",
+            "len": 7
+        },
+        "follower_right_hand": {
+            "topic": "/dex3/right/state",
+            "msg": "HandState",
+            "len": 7
         }
     },
 
@@ -88,8 +157,8 @@ NODE_CONFIG = {
 class G1AioRos2Node(Node):
     """
     ROS2 → 本地缓存
-    - leader: Float32MultiArray / Float32 -> np.ndarray
-    - follower: JointState -> dict(name->position)
+    - leader: Float32MultiArray / Float32 / Unitree motor_state -> np.ndarray
+    - follower: JointState -> dict(name->position), Unitree motor_state -> np.ndarray
     - camera: Image/CompressedImage -> RGB np.ndarray
     """
 
@@ -144,6 +213,10 @@ class G1AioRos2Node(Node):
             elif msg_name == "Float32":
                 msg_cls = Float32
                 callback = lambda msg, cname=comp_name: self._f32_callback_follower(cname, msg)
+            elif msg_name in MSG_ALIASES or msg_name.endswith("/LowState") or msg_name.endswith("/Dex3State") or msg_name.endswith("/HandState"):
+                msg_cls = _get_msg_class(msg_name)
+                expect_len = int(cfg.get("len", 0))
+                callback = lambda msg, cname=comp_name, el=expect_len: self._motor_state_callback_follower(cname, msg, el)
             else:
                 raise RuntimeError(f"Unsupported follower msg type: {msg_name}")
 
@@ -172,6 +245,10 @@ class G1AioRos2Node(Node):
             elif msg_name == "Float32":
                 msg_cls = Float32
                 callback = lambda msg, cname=comp_name: self._f32_callback_leader(cname, msg)
+            elif msg_name in MSG_ALIASES or msg_name.endswith("/LowState") or msg_name.endswith("/Dex3State") or msg_name.endswith("/HandState"):
+                msg_cls = _get_msg_class(msg_name)
+                expect_len = int(cfg.get("len", 0))
+                callback = lambda msg, cname=comp_name, el=expect_len: self._motor_state_callback_leader(cname, msg, el)
             else:
                 raise RuntimeError(f"Unsupported leader msg type: {msg_name}")
 
@@ -277,6 +354,44 @@ class G1AioRos2Node(Node):
                 self.recv_leader_status[comp_name] = CONNECT_TIMEOUT_FRAME
         except Exception as e:
             logger.error(f"Joint callback error (leader:{comp_name}): {e}")
+
+    # ======================
+    # callbacks: Unitree state
+    # ======================
+
+    @staticmethod
+    def _motor_state_positions(msg: Any, expect_len: int = 0) -> np.ndarray:
+        motor_state = getattr(msg, "motor_state", None)
+        if motor_state is None:
+            raise AttributeError("message has no motor_state field")
+
+        data = [float(state.q) for state in motor_state]
+        if expect_len > 0:
+            data = data[:expect_len]
+
+        return np.array(data, dtype=float)
+
+    def _motor_state_callback_follower(self, comp_name: str, msg: Any, expect_len: int = 0):
+        try:
+            data = self._motor_state_positions(msg, expect_len)
+            if expect_len > 0 and len(data) != expect_len:
+                logger.warning(f"[follower:{comp_name}] motor_state len mismatch: got {len(data)} expect {expect_len}")
+            with self.lock:
+                self.recv_follower[comp_name] = data
+                self.recv_follower_status[comp_name] = CONNECT_TIMEOUT_FRAME
+        except Exception as e:
+            logger.error(f"Motor state callback error (follower:{comp_name}): {e}")
+
+    def _motor_state_callback_leader(self, comp_name: str, msg: Any, expect_len: int = 0):
+        try:
+            data = self._motor_state_positions(msg, expect_len)
+            if expect_len > 0 and len(data) != expect_len:
+                logger.warning(f"[leader:{comp_name}] motor_state len mismatch: got {len(data)} expect {expect_len}")
+            with self.lock:
+                self.recv_leader[comp_name] = data
+                self.recv_leader_status[comp_name] = CONNECT_TIMEOUT_FRAME
+        except Exception as e:
+            logger.error(f"Motor state callback error (leader:{comp_name}): {e}")
 
     # ======================
     # callbacks: Float32 / Float32MultiArray

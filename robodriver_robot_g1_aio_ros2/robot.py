@@ -31,7 +31,7 @@ class G1AioRos2Robot(Robot):
 
 
         self.leader_motors = config.leader_motors
-        self.follower_motors = config.follower_motors["follower_joint_states"]
+        self.follower_motors = config.follower_motors
         self.cameras = make_cameras_from_configs(self.config.cameras)
 
         self.connect_excluded_cameras = ["image_pika_pose"]
@@ -49,7 +49,8 @@ class G1AioRos2Robot(Robot):
     def _follower_motors_ft(self) -> dict[str, type]:
         return {
             f"follower_{motor}.pos": float
-            for motor in self.follower_motors
+            for _comp_name, joints in self.follower_motors.items()
+            for motor in joints.keys()
         }
     
 
@@ -86,6 +87,95 @@ class G1AioRos2Robot(Robot):
     def is_connected(self) -> bool:
         return self.connected
 
+    @staticmethod
+    def _joint_value_from_map(joint_map: dict[str, Any], joint_name: str) -> Any | None:
+        if joint_name in joint_map:
+            return joint_map[joint_name]
+
+        short_name = joint_name
+        side_prefix = None
+        other_side_prefix = None
+        side_prefixes = ("left_hand_", "right_hand_")
+        for prefix in side_prefixes:
+            other_prefix = "right_hand_" if prefix == "left_hand_" else "left_hand_"
+            if joint_name.startswith(prefix):
+                side_prefix = prefix
+                other_side_prefix = other_prefix
+                short_name = joint_name[len(prefix):]
+                if short_name in joint_map:
+                    return joint_map[short_name]
+                break
+
+        for key, value in joint_map.items():
+            if joint_name in key:
+                return value
+            if key in joint_name and (other_side_prefix is None or other_side_prefix not in key):
+                return value
+            if short_name != joint_name and short_name in key:
+                if other_side_prefix is not None and other_side_prefix in key:
+                    continue
+                if side_prefix is not None and side_prefix in key:
+                    return value
+                if not any(prefix in key for prefix in side_prefixes):
+                    return value
+
+        return None
+
+    def _component_is_ready(
+        self,
+        cache: dict[str, Any],
+        comp_name: str,
+        joints: dict[str, Any],
+    ) -> bool:
+        data = cache.get(comp_name)
+        if data is None:
+            return False
+
+        if isinstance(data, dict):
+            return all(
+                self._joint_value_from_map(data, joint_name) is not None
+                for joint_name in joints
+            )
+
+        return hasattr(data, "__len__") and len(data) >= len(joints)
+
+    def _missing_component_joints(
+        self,
+        cache: dict[str, Any],
+        comp_name: str,
+        joints: dict[str, Any],
+    ) -> list[str]:
+        data = cache.get(comp_name)
+        joint_names = list(joints.keys())
+        if data is None:
+            return joint_names
+
+        if isinstance(data, dict):
+            return [
+                joint_name
+                for joint_name in joint_names
+                if self._joint_value_from_map(data, joint_name) is None
+            ]
+
+        if not hasattr(data, "__len__"):
+            return joint_names
+
+        return joint_names[len(data):]
+
+    def _component_joint_value(
+        self,
+        data: Any,
+        joint_name: str,
+        index: int,
+    ) -> Any | None:
+        if data is None:
+            return None
+        if isinstance(data, dict):
+            return self._joint_value_from_map(data, joint_name)
+        if hasattr(data, "__len__") and index < len(data):
+            return data[index]
+        return None
+
     # ========= connect / disconnect =========
 
     def connect(self):
@@ -114,23 +204,20 @@ class G1AioRos2Robot(Robot):
             ),
             (
                 lambda: all(
-                    (comp_name in self.robot_ros2_node.recv_leader) and
-                    (
-                        # vec: np.ndarray / list / tuple
-                        (hasattr(self.robot_ros2_node.recv_leader[comp_name], "__len__") and
-                        len(self.robot_ros2_node.recv_leader[comp_name]) >= len(joints))
+                    self._component_is_ready(
+                        self.robot_ros2_node.recv_leader,
+                        comp_name,
+                        joints,
                     )
                     for comp_name, joints in self.leader_motors.items()
                 ),
                 lambda: sorted([
-                    # 缺组件 or 长度不够都算 missing（展开到 joint 名方便你看）
                     joint_name
                     for comp_name, joints in self.leader_motors.items()
-                    for joint_name in joints.keys()
-                    if (
-                        (comp_name not in self.robot_ros2_node.recv_leader) or
-                        (not hasattr(self.robot_ros2_node.recv_leader[comp_name], "__len__")) or
-                        (len(self.robot_ros2_node.recv_leader[comp_name]) < len(joints))
+                    for joint_name in self._missing_component_joints(
+                        self.robot_ros2_node.recv_leader,
+                        comp_name,
+                        joints,
                     )
                 ]),
                 "等待主臂数据超时",
@@ -141,13 +228,21 @@ class G1AioRos2Robot(Robot):
             # 从臂
             (
                 lambda: all(
-                    any(name in key for _follower_name, follower in self.robot_ros2_node.recv_follower.items() for key in follower)
-                    for name in self.follower_motors
+                    self._component_is_ready(
+                        self.robot_ros2_node.recv_follower,
+                        comp_name,
+                        joints,
+                    )
+                    for comp_name, joints in self.follower_motors.items()
                 ),
                 lambda: [
-                    name
-                    for name in self.follower_motors
-                    if not any(name in key for _follower_name, follower in self.robot_ros2_node.recv_follower.items() for key in follower)
+                    joint_name
+                    for comp_name, joints in self.follower_motors.items()
+                    for joint_name in self._missing_component_joints(
+                        self.robot_ros2_node.recv_follower,
+                        comp_name,
+                        joints,
+                    )
                 ],
                 "等待从臂数据超时",
             ),
@@ -182,15 +277,23 @@ class G1AioRos2Robot(Robot):
                         ]
                     elif i == 1:
                         received = [
-                            name
-                            for name in self.leader_motors
-                            if name not in missing
+                            comp_name
+                            for comp_name, joints in self.leader_motors.items()
+                            if self._component_is_ready(
+                                self.robot_ros2_node.recv_leader,
+                                comp_name,
+                                joints,
+                            )
                         ]
                     else:
                         received = [
-                            name
-                            for name in self.follower_motors
-                            if name not in missing
+                            comp_name
+                            for comp_name, joints in self.follower_motors.items()
+                            if self._component_is_ready(
+                                self.robot_ros2_node.recv_follower,
+                                comp_name,
+                                joints,
+                            )
                         ]
 
                     msg = (
@@ -224,19 +327,24 @@ class G1AioRos2Robot(Robot):
         if conditions[1][0]():
             leader_received = []
             for comp_name, joints in self.leader_motors.items():
-                if comp_name not in self.robot_ros2_node.recv_leader:
-                    continue
-                vec = self.robot_ros2_node.recv_leader[comp_name]
-                if hasattr(vec, "__len__") and len(vec) >= len(joints):
+                if self._component_is_ready(
+                    self.robot_ros2_node.recv_leader,
+                    comp_name,
+                    joints,
+                ):
                     leader_received.append(comp_name)
 
             success_messages.append(f"主臂数据: {', '.join(leader_received)}")
 
         if conditions[2][0]():
             follower_received = [
-                name
-                for name in self.follower_motors
-                if any(name in key for _follower_name, follower in self.robot_ros2_node.recv_follower.items() for key in follower)
+                comp_name
+                for comp_name, joints in self.follower_motors.items()
+                if self._component_is_ready(
+                    self.robot_ros2_node.recv_follower,
+                    comp_name,
+                    joints,
+                )
             ]
             success_messages.append(f"从臂数据: {', '.join(follower_received)}")
 
@@ -286,34 +394,21 @@ class G1AioRos2Robot(Robot):
         #             if name == key:
         #                 obs_dict[f"follower_{name}.pos"] = float(value)
 
-        # ---- 逐组件展开，然后逐 joint 填入 ----
-        joint_map_all = {}
-        for _comp_name, joint_map in self.robot_ros2_node.recv_follower.items():
-            if isinstance(joint_map, dict):
-                joint_map_all.update(joint_map)
-
         missing = []
-        for joint_name in self.follower_motors.keys():   # AAHead_yaw, Head_pitch, ...
-            val = None
+        for comp_name, joints in self.follower_motors.items():
+            data = self.robot_ros2_node.recv_follower.get(comp_name)
+            joint_names = list(joints.keys())
 
-            # 1) 先精确匹配
-            if joint_name in joint_map_all:
-                val = joint_map_all[joint_name]
-            else:
-                # 2) 再做一次“子串匹配”（有些 joint_states 可能带前后缀）
-                for k, v in joint_map_all.items():
-                    if joint_name in k:
-                        val = v
-                        break
-
-            if val is None:
-                missing.append(joint_name)
-                obs_dict[f"follower_{joint_name}.pos"] = float("nan")  
-            else:
-                obs_dict[f"follower_{joint_name}.pos"] = float(val)
+            for index, joint_name in enumerate(joint_names):
+                val = self._component_joint_value(data, joint_name, index)
+                if val is None:
+                    missing.append(joint_name)
+                    obs_dict[f"follower_{joint_name}.pos"] = float("nan")
+                else:
+                    obs_dict[f"follower_{joint_name}.pos"] = float(val)
 
         if missing:
-            logger.warning(f"Missing follower joints in /joint_states: {missing[:8]}"
+            logger.warning(f"Missing follower joints in ROS state topics: {missing[:8]}"
                         + (f" (+{len(missing)-8} more)" if len(missing) > 8 else ""))
 
         dt_ms = (time.perf_counter() - start) * 1e3
@@ -347,17 +442,13 @@ class G1AioRos2Robot(Robot):
         # ---- 逐组件展开，然后逐 joint 填入 ----
         for comp_name, joints in self.leader_motors.items():
 
-            # node 中按组件名存放关节数组
-            vec = self.robot_ros2_node.recv_leader.get(comp_name)
-            if vec is None:
-                continue
-
+            data = self.robot_ros2_node.recv_leader.get(comp_name)
             joint_names = list(joints.keys())
 
             for idx, joint in enumerate(joint_names):
-                if idx >= len(vec):
-                    break
-                act_dict[f"leader_{joint}.pos"] = float(vec[idx])
+                val = self._component_joint_value(data, joint, idx)
+                if val is not None:
+                    act_dict[f"leader_{joint}.pos"] = float(val)
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f} ms")
@@ -389,4 +480,3 @@ class G1AioRos2Robot(Robot):
         self.robot_ros2_node.ros2_send(cleaned_action)
 
         return {f"{arm_motor}.pos": val for arm_motor, val in action.items()}
-
