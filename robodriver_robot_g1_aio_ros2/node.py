@@ -111,17 +111,17 @@ def _get_msg_class(msg_name: str):
 NODE_CONFIG = {
     "leader_joint_topics": {
         "leader_joint_states": {
-            "topic": "/lowcmd",
+            "topic": "/lowstate",
             "msg": "LowState",
             "len": 29
         },
         "leader_left_hand": {
-            "topic": "/dex3/left/cmd",
+            "topic": "/dex3/left/state",
             "msg": "HandState",
             "len": 7
         },
         "leader_right_hand": {
-            "topic": "/dex3/right/cmd",
+            "topic": "/dex3/right/state",
             "msg": "HandState",
             "len": 7
         }
