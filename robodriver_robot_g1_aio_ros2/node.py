@@ -48,6 +48,7 @@ from rclpy.qos import (
 logger = logging_mp.get_logger(__name__)
 
 CONNECT_TIMEOUT_FRAME = 10
+_RCLPY_INIT_LOCK = threading.Lock()
 
 QOS_BEST_EFFORT = QoSProfile(
     history=QoSHistoryPolicy.KEEP_LAST,
@@ -105,6 +106,12 @@ def _get_msg_class(msg_name: str):
             last_error = exc
 
     raise RuntimeError(f"Unsupported ROS msg type: {msg_name}") from last_error
+
+
+def ensure_rclpy_initialized():
+    with _RCLPY_INIT_LOCK:
+        if not rclpy.ok():
+            rclpy.init(args=None)
 
 
 # 由生成脚本根据 JSON 自动生成
@@ -168,6 +175,7 @@ class G1AioRos2Node(Node):
         follower_joint_topics: Optional[Dict[str, Dict[str, str]]] = None,
         camera_topics: Optional[Dict[str, Dict[str, str]]] = None,
     ):
+        ensure_rclpy_initialized()
         super().__init__("g1_aio_ros2_direct")
 
         self.leader_joint_cfgs = leader_joint_topics or NODE_CONFIG["leader_joint_topics"]
@@ -287,6 +295,7 @@ class G1AioRos2Node(Node):
         # executor for spin thread
         self._executor: Optional[SingleThreadedExecutor] = None
         self._spin_thread: Optional[threading.Thread] = None
+        self._destroyed = False
 
         logger.info("[Direct] READY (ROS2 subscriptions created).")
 
@@ -524,6 +533,8 @@ class G1AioRos2Node(Node):
     # ======================
 
     def start(self):
+        if self._destroyed:
+            raise RuntimeError("Cannot start a destroyed ROS2 node")
         if self.running:
             return
         self.running = True
@@ -544,7 +555,7 @@ class G1AioRos2Node(Node):
             logger.error(f"[ROS2] Spin error: {e}")
 
     def stop(self):
-        if not self.running:
+        if self._destroyed:
             return
         self.running = False
 
@@ -562,13 +573,14 @@ class G1AioRos2Node(Node):
         finally:
             self._executor = None
 
+        if self._spin_thread is not None:
+            self._spin_thread.join(timeout=1.0)
+            self._spin_thread = None
+
         try:
             self.destroy_node()
         except Exception:
             pass
-
-        if self._spin_thread is not None:
-            self._spin_thread.join(timeout=1.0)
-            self._spin_thread = None
+        self._destroyed = True
 
         logger.info("[ROS2] Node stopped.")

@@ -1,7 +1,6 @@
 import time
 import logging_mp
 import numpy as np
-import rclpy
 
 from functools import cached_property
 from typing import Any
@@ -38,10 +37,13 @@ class G1AioRos2Robot(Robot):
 
 
         self.robot_ros2_node = G1AioRos2Node()
-        # self.robot_ros2_node.start()
 
         self.connected = False
         self.logs = {}
+
+    def _ensure_ros2_node(self):
+        if getattr(self.robot_ros2_node, "_destroyed", False):
+            self.robot_ros2_node = G1AioRos2Node()
 
     # ========= features =========
 
@@ -185,6 +187,9 @@ class G1AioRos2Robot(Robot):
         if self.connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
+        self._ensure_ros2_node()
+        self.robot_ros2_node.start()
+
         # 约定：node 里有 recv_images / recv_follower / recv_leader
         conditions = [
             # 摄像头图像
@@ -305,9 +310,12 @@ class G1AioRos2Robot(Robot):
                 if not failed_messages:
                     break
 
-                raise TimeoutError(
-                    f"连接超时，未满足的条件: {'; '.join(failed_messages)}"
-                )
+                try:
+                    raise TimeoutError(
+                        f"连接超时，未满足的条件: {'; '.join(failed_messages)}"
+                    )
+                finally:
+                    self.robot_ros2_node.stop()
 
 
             time.sleep(0.01)
@@ -356,16 +364,21 @@ class G1AioRos2Robot(Robot):
         self.connected = True
     
     def get_node(self):
+        self._ensure_ros2_node()
         return self.robot_ros2_node
 
     def disconnect(self):
         if not self.connected:
             raise DeviceNotConnectedError()
         self.connected = False
+        self.robot_ros2_node.stop()
 
     def __del__(self):
-        if getattr(self, "connected", False):
-            self.disconnect()
+        try:
+            if hasattr(self, "robot_ros2_node"):
+                self.robot_ros2_node.stop()
+        except Exception:
+            pass
 
     # ========= calibrate / configure =========
 
